@@ -61,20 +61,38 @@ class Llava(lmms):
         attn_implementation=best_fit_attn_implementation,
         device_map="cuda:0",
         conv_template="vicuna_v1",
+        token_prune_strategy: str = "none",
+        token_prune_config: Optional[str] = None,
         use_cache=True,
         tie_weights: bool = True,
         truncate_context=False,  # whether to truncate the context in generation, set it False for LLaVA-1.6
         customized_config=None,  # ends in json
+        virtual_world_size: int = 1,
+        virtual_rank: int = 0,
+        virtual_device: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
         # Do not use kwargs for now
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
 
+        virtual_world_size = int(virtual_world_size or 1)
+        virtual_rank = int(virtual_rank or 0)
+        if virtual_world_size < 1:
+            raise ValueError(f"virtual_world_size must be >= 1, got {virtual_world_size}")
+        if virtual_rank < 0 or virtual_rank >= virtual_world_size:
+            raise ValueError(f"virtual_rank must be in [0, {virtual_world_size}), got {virtual_rank}")
+
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
         self.accelerator = accelerator
-        if accelerator.num_processes > 1:
+        self.virtual_data_parallel = virtual_world_size > 1
+        self.uses_distributed_gather = False
+        if self.virtual_data_parallel:
+            target_device = virtual_device or device or "cuda:0"
+            self._device = torch.device(target_device)
+            self.device_map = target_device
+        elif accelerator.num_processes > 1:
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
             self.device_map = f"cuda:{accelerator.local_process_index}"
         elif accelerator.num_processes == 1 and device_map == "auto":
@@ -101,10 +119,32 @@ class Llava(lmms):
             # for older versions of LLaVA that don't have multimodal argument
             llava_model_args.pop("multimodal", None)
             self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, None, model_name, device_map=self.device_map, **llava_model_args)
+
+        self.token_prune_strategy = token_prune_strategy
+        self.token_prune_strategy_config = None
+        if token_prune_config is not None:
+            try:
+                import json
+
+                self.token_prune_strategy_config = json.loads(token_prune_config)
+                eval_logger.info(f"Parsed token prune config: {self.token_prune_strategy_config}")
+            except json.JSONDecodeError as e:
+                eval_logger.warning(f"Failed to parse token_prune_config: {e}")
+
+        if self.token_prune_strategy and self.token_prune_strategy != "none":
+            try:
+                from llava.model.token_prune_strategies import apply_strategy_by_name, list_strategies
+
+                eval_logger.info(f"Applying token prune strategy: {self.token_prune_strategy}")
+                self._model = apply_strategy_by_name(self._model, self.token_prune_strategy, self.token_prune_strategy_config)
+                eval_logger.info(f"Token prune strategy applied. Available strategies: {list_strategies()}")
+            except Exception as e:
+                eval_logger.error(f"Failed to apply token prune strategy {self.token_prune_strategy}: {e}")
         self._config = self._model.config
         self.model.eval()
         if tie_weights:
             self.model.tie_weights()
+
 
         self.truncation = truncation
         self.batch_size_per_gpu = int(batch_size)
@@ -112,7 +152,12 @@ class Llava(lmms):
         self.use_cache = use_cache
         self.truncate_context = truncate_context
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
-        if accelerator.num_processes > 1:
+        if self.virtual_data_parallel:
+            eval_logger.info(f"Using virtual data parallelism on {self._device}: rank {virtual_rank}/{virtual_world_size}")
+            self.model.to(self._device)
+            self._rank = virtual_rank
+            self._world_size = virtual_world_size
+        elif accelerator.num_processes > 1:
             assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED], "Unsupported distributed type provided. Only DDP and FSDP are supported."
             # If you want to use DistributedType.DEEPSPEED, you have to run accelerate config before using the model
             # Also, you have to select zero stage 0 (equivalent to DDP) in order to make the prepare model works
@@ -130,6 +175,7 @@ class Llava(lmms):
             else:
                 self._model = accelerator.prepare_model(self.model, evaluation_mode=True)
             self.accelerator = accelerator
+            self.uses_distributed_gather = True
             if self.accelerator.is_local_main_process:
                 eval_logger.info(f"Using {accelerator.num_processes} devices with data parallelism")
             self._rank = self.accelerator.local_process_index
@@ -286,50 +332,24 @@ class Llava(lmms):
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
+        debug_batch_prints = 0
 
-        def _collate(x):
-            # the negative sign on len(toks) sorts descending - this has a few advantages:
-            # - time estimates will always be over not underestimates, which is more useful for planning
-            # - to know the size of a batch when going through the list, you know the first one is always the batch
-            #   padded context length. this is useful to simplify the batching logic and more importantly to make
-            #   automatic adaptive batches much much easier to implement
-            # - any OOMs will happen right away rather than near the end
-            toks = self.tok_encode(x[0])
-            return -len(toks), x[0]
+        request_args = [reg.args for reg in requests]
+        chunks = [request_args[i : i + self.batch_size] for i in range(0, len(request_args), self.batch_size)]
+        pbar = tqdm(total=len(chunks), disable=(self.rank != 0), desc="Model Responding")
 
-        # we group requests by their generation_kwargs,
-        # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
-        # in the same batch.
-        re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
-        chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
-        num_iters = len(requests) // self.batch_size if len(requests) % self.batch_size == 0 else len(requests) // self.batch_size + 1
-        pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
         for chunk in chunks:
             contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
             task = task[0]
             split = split[0]
             batched_visuals = [doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id]  # [B, N]
             flattened_visuals = self.flatten(batched_visuals)  # [B*N]
-            # we assume all gen kwargs in the batch are the same
-            # this is safe to assume because the `grouper` object ensures it.
-            gen_kwargs = all_gen_kwargs[0]
+            gen_kwargs = dict(all_gen_kwargs[0]) if isinstance(all_gen_kwargs[0], dict) else all_gen_kwargs[0]
 
-            # Set default values for until and max_new_tokens
-            until = [self.tok_decode(self.eot_token_id)]
-
-            # Update values from gen_kwargs if present
-            if "until" in gen_kwargs:
-                until = gen_kwargs.pop("until")
-                if isinstance(until, str):
-                    until = [until]
-                elif not isinstance(until, list):
-                    raise ValueError(f"Expected `gen_kwargs['until']` to be of type Union[str,list] but got {type(until)}")
-
-            if "image_aspect_ratio" in gen_kwargs.keys() and "image_aspect_ratio" not in self._config.__dict__:
-                # here we should pop it out of gen_kwargs so that it doesn't get passed to the model for next step of generation
+            if isinstance(gen_kwargs, dict) and "image_aspect_ratio" in gen_kwargs and "image_aspect_ratio" not in self._config.__dict__:
                 self._config.image_aspect_ratio = gen_kwargs.pop("image_aspect_ratio")
                 eval_logger.info(f"Setting image aspect ratio: {self._config.image_aspect_ratio}")
-            # encode, pad, and truncate contexts for this batch
+
             if flattened_visuals:
                 image_tensor = process_images(flattened_visuals, self._image_processor, self._config)
                 if type(image_tensor) is list:
@@ -339,92 +359,88 @@ class Llava(lmms):
             else:
                 image_tensor = None
 
-            # prompts_input = contexts[0]
-
             question_input = []
-
             for visual, context in zip(batched_visuals, contexts):
-                if image_tensor is not None and len(image_tensor) != 0 and DEFAULT_IMAGE_TOKEN not in context:
-                    """
-                    Three senarios:
-                    1. No image, and there for, no image token should be added.
-                    2. image token is already specified in the context, so we don't need to add it.
-                    3. image token is not specified in the context and there is image inputs, so we need to add it. In this case, we add the image token at the beginning of the context and add a new line.
-                    """
+                if image_tensor is not None and len(flattened_visuals) != 0 and DEFAULT_IMAGE_TOKEN not in context:
                     image_tokens = [DEFAULT_IMAGE_TOKEN] * len(visual) if isinstance(visual, list) else [DEFAULT_IMAGE_TOKEN]
-                    image_tokens = " ".join(image_tokens)
-                    question = image_tokens + "\n" + context
+                    question = " ".join(image_tokens) + "\n" + context
                 else:
                     question = context
-                # This is much safer for llama3, as we now have some object type in it
                 if "llama_3" in self.conv_template:
                     conv = copy.deepcopy(conv_templates[self.conv_template])
                 else:
                     conv = conv_templates[self.conv_template].copy()
                 conv.append_message(conv.roles[0], question)
                 conv.append_message(conv.roles[1], None)
-                prompt_question = conv.get_prompt()
-                question_input.append(prompt_question)
+                question_input.append(conv.get_prompt())
 
-            # input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(self.device)
-            # preconfigure gen_kwargs with defaults
-            gen_kwargs["image_sizes"] = [flattened_visuals[idx].size for idx in range(len(flattened_visuals))]
-            if "max_new_tokens" not in gen_kwargs:
-                gen_kwargs["max_new_tokens"] = 1024
-            if "temperature" not in gen_kwargs:
-                gen_kwargs["temperature"] = 0
-            if "top_p" not in gen_kwargs:
-                gen_kwargs["top_p"] = None
-            if "num_beams" not in gen_kwargs:
-                gen_kwargs["num_beams"] = 1
+            if isinstance(gen_kwargs, dict):
+                gen_kwargs["image_sizes"] = [flattened_visuals[idx].size for idx in range(len(flattened_visuals))]
+                gen_kwargs.setdefault("max_new_tokens", 1024)
+                gen_kwargs.setdefault("temperature", 0)
+                gen_kwargs.setdefault("top_p", None)
+                gen_kwargs.setdefault("num_beams", 1)
 
             input_ids_list = [tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt") for prompt in question_input]
             pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
-            # These steps are not in LLaVA's original code, but are necessary for generation to work
-            # TODO: attention to this major generation step...
-            try:
-                cont = self.model.generate(
-                    input_ids,
-                    attention_mask=attention_masks,
-                    pad_token_id=pad_token_ids,
-                    images=image_tensor,
-                    image_sizes=gen_kwargs["image_sizes"],
-                    do_sample=True if gen_kwargs["temperature"] > 0 else False,
-                    temperature=gen_kwargs["temperature"],
-                    top_p=gen_kwargs["top_p"],
-                    num_beams=gen_kwargs["num_beams"],
-                    max_new_tokens=gen_kwargs["max_new_tokens"],
-                    use_cache=self.use_cache,
-                )
-                text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
-            except Exception as e:
-                raise e
-                eval_logger.error(f"Error {e} in generating")
-                cont = ""
-                text_outputs = [""]
 
-            # cont_toks_list = cont.tolist()
-            # for cont_toks, context in zip(cont_toks_list, contexts):
-            # discard context + left-padding toks if using causal decoder-only LMM
-            # if self.truncate_context:
-            #     cont_toks = cont_toks[input_ids.shape[1] :]
-            # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-            # if self.truncate_context:
-            #     for term in until:
-            #         if len(term) > 0:
-            #             # ignore '' separator,
-            #             # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
-            #             text_outputs = text_outputs.split(term)[0]
+            cont = self.model.generate(
+                input_ids,
+                attention_mask=attention_masks,
+                pad_token_id=pad_token_ids,
+                images=image_tensor,
+                image_sizes=gen_kwargs["image_sizes"] if isinstance(gen_kwargs, dict) else [],
+                do_sample=True if (isinstance(gen_kwargs, dict) and gen_kwargs.get("temperature", 0) > 0) else False,
+                temperature=gen_kwargs.get("temperature", 0) if isinstance(gen_kwargs, dict) else 0,
+                top_p=gen_kwargs.get("top_p", None) if isinstance(gen_kwargs, dict) else None,
+                num_beams=gen_kwargs.get("num_beams", 1) if isinstance(gen_kwargs, dict) else 1,
+                max_new_tokens=gen_kwargs.get("max_new_tokens", 1024) if isinstance(gen_kwargs, dict) else 1024,
+                use_cache=self.use_cache,
+            )
+            text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
+            if isinstance(text_outputs, str):
+                text_outputs = [text_outputs]
+            if len(text_outputs) != len(chunk):
+                eval_logger.warning(
+                    f"decoded_outputs={len(text_outputs)} != chunk_size={len(chunk)}; padding/truncating to match."
+                )
+                if len(text_outputs) < len(chunk):
+                    text_outputs = list(text_outputs) + [""] * (len(chunk) - len(text_outputs))
+                else:
+                    text_outputs = list(text_outputs)[: len(chunk)]
+
+            if self.batch_size > 1 and debug_batch_prints < 3:
+                try:
+                    cont_shape = tuple(cont.shape)
+                except Exception:
+                    cont_shape = "unknown"
+                eval_logger.info(
+                    f"[batch-debug] chunk_size={len(chunk)} input_ids_shape={tuple(input_ids.shape)} "
+                    f"cont_shape={cont_shape} decoded={len(text_outputs)}"
+                )
+                debug_batch_prints += 1
+
             res.extend(text_outputs)
-            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
+            try:
+                self.cache_hook.add_partial("generate_until", (contexts[0], gen_kwargs), text_outputs)
+            except Exception:
+                pass
             pbar.update(1)
-            # reorder this group of results back to original unsorted form
-        res = re_ords.get_original(res)
 
         pbar.close()
+        # Defensive normalization: evaluator expects one output per request.
+        if self.rank == 0 and len(res) != len(requests):
+            eval_logger.warning(
+                f"generate_until returned {len(res)} outputs for {len(requests)} requests; padding/truncating to match."
+            )
+        if len(res) < len(requests):
+            res = list(res) + [""] * (len(requests) - len(res))
+        elif len(res) > len(requests):
+            res = list(res)[: len(requests)]
         return res
+
 
     def generate_until_multi_round(self, requests) -> List[str]:
         raise NotImplementedError("TODO: Implement multi-round generation for LLaVA")

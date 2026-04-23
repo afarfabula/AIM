@@ -264,6 +264,24 @@ def parse_eval_args() -> argparse.Namespace:
         action="store_true",
         help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
     )
+    parser.add_argument(
+        "--virtual_world_size",
+        type=int,
+        default=1,
+        help="Run single-GPU multi-process sharding without torch.distributed. Each process uses the same device and a different virtual rank.",
+    )
+    parser.add_argument(
+        "--virtual_rank",
+        type=int,
+        default=0,
+        help="Virtual data-parallel rank for single-GPU multi-process sharding.",
+    )
+    parser.add_argument(
+        "--virtual_device",
+        type=str,
+        default=None,
+        help="Device used by virtual data-parallel workers, e.g. cuda:0.",
+    )
     args = parser.parse_args()
     return args
 
@@ -492,12 +510,16 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         numpy_random_seed=args.seed[1],
         torch_random_seed=args.seed[2],
         fewshot_random_seed=args.seed[3],
+        virtual_world_size=args.virtual_world_size,
+        virtual_rank=args.virtual_rank,
+        virtual_device=args.virtual_device,
         cli_args=args,
         datetime_str=datetime_str,
         **request_caching_args,
     )
 
     if results is not None:
+        virtual_shard_state = results.pop("_virtual_dp_state", None)
         if args.log_samples:
             samples = results.pop("samples")
         else:
@@ -509,6 +531,8 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
 
         evaluation_tracker.save_results_aggregated(results=results, samples=samples if args.log_samples else None, datetime_str=datetime_str)
+        if virtual_shard_state is not None:
+            evaluation_tracker.save_virtual_shard_state(virtual_shard_state)
 
         if args.log_samples:
             for task_name, config in results["configs"].items():

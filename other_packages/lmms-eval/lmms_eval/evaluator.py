@@ -46,6 +46,33 @@ from lmms_eval.utils import (
 )
 
 
+def _distributed_gather_enabled(lm) -> bool:
+    return bool(
+        getattr(lm, "uses_distributed_gather", False)
+        and dist.is_available()
+        and dist.is_initialized()
+    )
+
+
+def _serialize_virtual_task_state(eval_tasks):
+    virtual_state = {}
+    for task_output in eval_tasks:
+        metric_entries = []
+        for (metric, filter_key), values in task_output.sample_metrics.items():
+            metric_entries.append(
+                {
+                    "metric": metric,
+                    "filter_key": filter_key,
+                    "values": list(values),
+                }
+            )
+        virtual_state[task_output.task_name] = {
+            "sample_metrics": metric_entries,
+            "logged_samples": list(task_output.logged_samples),
+        }
+    return virtual_state
+
+
 @positional_deprecated
 def simple_evaluate(
     model,
@@ -77,6 +104,9 @@ def simple_evaluate(
     torch_random_seed: int = 1234,
     fewshot_random_seed: int = 1234,
     datetime_str: str = get_datetime_str(),
+    virtual_world_size: int = 1,
+    virtual_rank: int = 0,
+    virtual_device: Optional[str] = None,
     cli_args=None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
@@ -171,6 +201,9 @@ def simple_evaluate(
         {
             "batch_size": batch_size,
             "device": device,
+            "virtual_world_size": virtual_world_size,
+            "virtual_rank": virtual_rank,
+            "virtual_device": virtual_device,
         },
     )
 
@@ -260,7 +293,8 @@ def simple_evaluate(
         del lm._model
         torch.cuda.empty_cache()
 
-    if lm.rank == 0:
+    should_return_results = (lm.rank == 0) or (not _distributed_gather_enabled(lm))
+    if should_return_results:
         if isinstance(model, str):
             model_name = model
         elif hasattr(model, "config") and hasattr(model.config, "_name_or_path"):
@@ -290,6 +324,9 @@ def simple_evaluate(
                 "numpy_seed": numpy_random_seed,
                 "torch_seed": torch_random_seed,
                 "fewshot_seed": fewshot_random_seed,
+                "virtual_world_size": virtual_world_size,
+                "virtual_rank": virtual_rank,
+                "virtual_device": virtual_device,
             }
         )
         results["git_hash"] = get_git_commit_hash()
@@ -368,6 +405,7 @@ def evaluate(
     task_group_alias = collections.defaultdict(dict)
     # store num-fewshot value per task
     num_fewshot = collections.defaultdict(int)
+    distributed_gather = _distributed_gather_enabled(lm)
 
     # get lists of group hierarchy and each type of request
     eval_tasks = get_task_list(task_dict)
@@ -430,7 +468,7 @@ def evaluate(
             reqtype = instance.request_type
             requests[reqtype].append(instance)
 
-        if lm.world_size > 1:
+        if distributed_gather:
             instances_rnk = torch.tensor(len(task._instances), device=lm.device)
             gathered_item = lm.accelerator.gather(instances_rnk).cpu().detach().numpy().tolist()
             # "multiple_choice" task types dispatch (several) "loglikelihood" request types
@@ -449,7 +487,7 @@ def evaluate(
         for req in reqs:
             cloned_reqs.extend([req] * req.repeats)
 
-        if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
+        if distributed_gather and (padding_requests[reqtype] > 0):
             for _ in range(padding_requests[reqtype]):
                 cloned_reqs.extend([req] * req.repeats)
 
@@ -460,7 +498,7 @@ def evaluate(
         for x, req in zip(resps, cloned_reqs):
             req.resps.append(x)
 
-        if lm.world_size > 1:
+        if distributed_gather:
             lm.accelerator.wait_for_everyone()
 
     RANK = lm.rank
@@ -528,7 +566,7 @@ def evaluate(
 
             pbar.close()
 
-    if WORLD_SIZE > 1:
+    if distributed_gather:
         # if multigpu, then gather data across all ranks to rank 0
         # first gather logged samples across all ranks
         for task_output in eval_tasks:
@@ -561,7 +599,7 @@ def evaluate(
 
         dist.barrier()  # Ensure all processes are synced before proceeding
 
-    if RANK == 0:
+    if (RANK == 0) or (not distributed_gather):
         ### Aggregate results over all datapoints ###
         # aggregate results ; run bootstrap CIs
         for task_output in eval_tasks:
@@ -619,10 +657,16 @@ def evaluate(
         }
         if log_samples:
             results_dict["samples"] = dict(samples)
+        if (WORLD_SIZE > 1) and (not distributed_gather):
+            results_dict["_virtual_dp_state"] = {
+                "rank": RANK,
+                "world_size": WORLD_SIZE,
+                "task_state": _serialize_virtual_task_state(eval_tasks),
+            }
     else:
         results_dict = None
 
-    if hasattr(lm, "accelerator"):
+    if distributed_gather and hasattr(lm, "accelerator"):
         lm.accelerator.wait_for_everyone()
 
     return results_dict

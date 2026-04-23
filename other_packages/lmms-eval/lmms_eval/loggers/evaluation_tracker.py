@@ -321,6 +321,31 @@ class EvaluationTracker:
         else:
             eval_logger.info("Output path not provided, skipping saving sample results")
 
+    def save_virtual_shard_state(self, shard_state: dict) -> None:
+        if not self.output_path:
+            eval_logger.info("Output path not provided, skipping saving virtual shard state")
+            return
+
+        try:
+            path = Path(self.output_path if self.output_path else Path.cwd())
+            path = path.joinpath(self.general_config_tracker.model_name_sanitized)
+            path.mkdir(parents=True, exist_ok=True)
+
+            rank = shard_state.get("rank", 0)
+            date_id = self.date_id if hasattr(self, "date_id") else get_datetime_str()
+            file_virtual_shard = path.joinpath(f"{date_id}_virtual_shard_rank{rank}.json")
+            file_virtual_shard.open("w", encoding="utf-8").write(
+                json.dumps(
+                    shard_state,
+                    indent=2,
+                    default=handle_non_serializable,
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as e:
+            eval_logger.warning("Could not save virtual shard state")
+            eval_logger.info(repr(e))
+
     def recreate_metadata_card(self) -> None:
         """
         Creates a metadata card for the evaluation results dataset and pushes it to the Hugging Face hub.

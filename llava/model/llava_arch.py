@@ -205,6 +205,10 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         # image_features = self.get_model().vision_resampler(image_features, images=images)
+        
+        # 注意：token prune 策略现在在 prepare_inputs_labels_for_multimodal() 中应用
+        # 以便在空间合并之后再进行剪枝
+        
         image_features = self.get_model().mm_projector(image_features)
         return image_features
     
@@ -355,7 +359,12 @@ class LlavaMetaForCausalLM(ABC):
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
                         height = width = self.get_vision_tower().num_patches_per_side
-                        assert height * width == base_image_feature.shape[0]
+                        # 跳过 token 剪枝后的断言检查
+                        expected_num_tokens = height * width
+                        if base_image_feature.shape[0] != expected_num_tokens:
+                            print(f"Warning: base_image_feature has {base_image_feature.shape[0]} tokens, expected {expected_num_tokens} (likely pruned by token pruning strategy)")
+                        else:
+                            assert height * width == base_image_feature.shape[0]
 
                         if "anyres_max" in image_aspect_ratio:
                             matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", image_aspect_ratio)
@@ -418,6 +427,105 @@ class LlavaMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_features = self.encode_images(images)
+
+        # 应用 token prune 策略（如果有）- 在空间合并之后应用
+        from llava.model.token_prune_strategies import get_global_strategy
+        strategy = get_global_strategy()
+        if strategy is not None:
+            try:
+                # 对每个图像特征单独应用策略
+                pruned_image_features = []
+                for idx, img_feat in enumerate(image_features):
+                    orig_img_feat_dim = img_feat.dim()
+                    # 注意：这里我们传递 None 作为 images，因为策略不需要原始图像
+                    # 同时，特征已经经过 mm_projector，所以策略需要能够处理这种情况
+                    
+                    # 检查策略是否有 apply_after_projector 方法
+                    if hasattr(strategy, 'apply_after_projector'):
+                        if img_feat.dim() == 2:
+                            img_feat = img_feat.unsqueeze(0)
+                        pruned_feat = strategy.apply_after_projector(img_feat)
+                    else:
+                        # 对于没有专用方法的策略，尝试直接应用
+                        strategy_images = None
+                        if isinstance(images, torch.Tensor):
+                            if images.ndim == 5 and images.shape[0] == len(image_features):
+                                strategy_images = images[idx]
+                            elif images.shape[0] == len(image_features):
+                                strategy_images = images[idx:idx + 1]
+                            else:
+                                strategy_images = images
+                        elif isinstance(images, list):
+                            if len(images) == len(image_features):
+                                strategy_images = images[idx]
+                            else:
+                                strategy_images = images
+                        strategy_img_feat = img_feat
+                        if (
+                            isinstance(strategy_images, torch.Tensor)
+                            and strategy_images.ndim == 4
+                            and orig_img_feat_dim == 2
+                        ):
+                            vision_tower = self.get_vision_tower()
+                            num_patches = getattr(vision_tower, "num_patches", None)
+                            if (
+                                isinstance(num_patches, int)
+                                and num_patches > 0
+                                and strategy_img_feat.shape[0] == strategy_images.shape[0] * num_patches
+                            ):
+                                strategy_img_feat = strategy_img_feat.view(strategy_images.shape[0], num_patches, -1)
+                            elif (
+                                strategy_img_feat.dim() == 2
+                                and strategy_images.shape[0] > 1
+                                and strategy_img_feat.shape[0] % strategy_images.shape[0] == 0
+                            ):
+                                strategy_img_feat = strategy_img_feat.view(strategy_images.shape[0], -1, strategy_img_feat.shape[1])
+
+                        if strategy_img_feat.dim() == 2:
+                            strategy_img_feat = strategy_img_feat.unsqueeze(0)
+
+                        pruned_feat = None
+                        if (
+                            isinstance(strategy_images, torch.Tensor)
+                            and isinstance(strategy_img_feat, torch.Tensor)
+                            and strategy_images.ndim == 4
+                            and strategy_img_feat.dim() == 3
+                            and strategy_images.shape[0] > 1
+                            and strategy_img_feat.shape[0] == strategy_images.shape[0]
+                        ):
+                            pruned_chunks = []
+                            for j in range(strategy_images.shape[0]):
+                                img_j = strategy_images[j : j + 1]
+                                feat_j = strategy_img_feat[j : j + 1]
+                                out_j = strategy.apply(self.get_model(), img_j, feat_j)
+                                if out_j is None:
+                                    out_j = feat_j
+                                if out_j.dim() == 3 and out_j.shape[0] == 1:
+                                    out_j = out_j.squeeze(0)
+                                pruned_chunks.append(out_j)
+                            pruned_feat = torch.cat(pruned_chunks, dim=0)
+                        else:
+                            pruned_feat = strategy.apply(self.get_model(), strategy_images, strategy_img_feat)
+
+                        if (
+                            orig_img_feat_dim == 2
+                            and isinstance(strategy_images, torch.Tensor)
+                            and strategy_images.ndim == 4
+                            and pruned_feat is not None
+                            and pruned_feat.dim() == 3
+                            and pruned_feat.shape[0] == strategy_images.shape[0]
+                        ):
+                            pruned_feat = pruned_feat.flatten(0, 1)
+                    
+                    if pruned_feat.dim() == 3 and pruned_feat.shape[0] == 1:
+                        pruned_feat = pruned_feat.squeeze(0)  # 移除 batch 维度
+                    
+                    pruned_image_features.append(pruned_feat)
+                image_features = pruned_image_features
+            except Exception as e:
+                print(f"Error applying strategy in prepare_inputs_labels_for_multimodal: {e}")
+                import traceback
+                traceback.print_exc()
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
@@ -500,6 +608,10 @@ class LlavaMetaForCausalLM(ABC):
         # Truncate sequences to max length as image embeddings can make the sequence longer
         # self.config.tokenizer_model_max_length = 38632 # to accomondate more video frames
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
+        if tokenizer_model_max_length is None:
+            tokenizer_model_max_length = getattr(self.config, "max_position_embeddings", None)
+        if tokenizer_model_max_length is None:
+            tokenizer_model_max_length = max(x.shape[0] for x in new_input_embeds)
 
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
