@@ -1,0 +1,44 @@
+#!/bin/bash
+set -euo pipefail
+
+WORKER_ID="${WORKER_ID:-3791346}"
+ROOT="/mlx_devbox/users/quyanyi/playground/AIM"
+QUEUE_SH="${QUEUE_SH:-$ROOT/scripts/run_top10_ablation_queue.sh}"
+HTTP_PROXY_VALUE="${HTTP_PROXY_VALUE:-http://sys-proxy-rd-relay.byted.org:3128}"
+HTTPS_PROXY_VALUE="${HTTPS_PROXY_VALUE:-http://sys-proxy-rd-relay.byted.org:3128}"
+NO_PROXY_VALUE="${NO_PROXY_VALUE:-localhost,.byted.org,byted.org,.bytedance.net,bytedance.net,127.0.0.1,127.0.0.0/8,169.254.0.0/16,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8,::1,fe80::/10,fd00::/8}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+LIMIT="${LIMIT:-none}"
+QUEUE_NAME="${QUEUE_NAME:-top10_extra_ablations}"
+PYTHON="${PYTHON:-/tmp/aim_venv/bin/python}"
+CACHE_ROOT="${CACHE_ROOT:-/mlx_devbox/users/quyanyi/playground/AIM/hf_cache_shared}"
+
+exec env NO_COLOR=1 TERM=dumb mlx worker login "$WORKER_ID" -- env \
+  HTTP_PROXY="$HTTP_PROXY_VALUE" \
+  HTTPS_PROXY="$HTTPS_PROXY_VALUE" \
+  http_proxy="$HTTP_PROXY_VALUE" \
+  https_proxy="$HTTPS_PROXY_VALUE" \
+  NO_PROXY="$NO_PROXY_VALUE" \
+  no_proxy="$NO_PROXY_VALUE" \
+  HF_ENDPOINT="${HF_ENDPOINT:-http://huggingface-proxy-sg.byted.org}" \
+  HF_HOME="${HF_HOME:-$CACHE_ROOT}" \
+  HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$CACHE_ROOT/datasets}" \
+  HF_HUB_CACHE="${HF_HUB_CACHE:-$CACHE_ROOT/hub}" \
+  HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$CACHE_ROOT/hub}" \
+  TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$CACHE_ROOT/hub}" \
+  HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
+  HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}" \
+  HF_DATASETS_TRUST_REMOTE_CODE="${HF_DATASETS_TRUST_REMOTE_CODE:-1}" \
+  TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}" \
+  PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}" \
+  TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/triton_cache}" \
+  HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}" \
+  HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}" \
+  CACHE_ROOT="$CACHE_ROOT" \
+  PYTHON="$PYTHON" \
+  ATTN_IMPLEMENTATION="$ATTN_IMPLEMENTATION" \
+  BATCH_SIZE="$BATCH_SIZE" \
+  LIMIT="$LIMIT" \
+  QUEUE_NAME="$QUEUE_NAME" \
+  /bin/bash "$QUEUE_SH"

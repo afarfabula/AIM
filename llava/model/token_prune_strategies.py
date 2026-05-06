@@ -234,8 +234,26 @@ class BisheMethodStrategy(AIMStrategy):
             "left": (side // 2) * side,
             "right": (side // 2) * side + side - 1,
         }
+
+        def grid_points(n: int):
+            if n <= 1:
+                return [side // 2]
+            return [round(i * (side - 1) / (n - 1)) for i in range(n)]
+
         idxs = []
         for name in self.anchor_points:
+            if name.startswith("grid") and "x" in name:
+                grid_name = name[len("grid"):]
+                parts = grid_name.split("x", 1)
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    gy = int(parts[0])
+                    gx = int(parts[1])
+                    ys = grid_points(gy)
+                    xs = grid_points(gx)
+                    for y in ys:
+                        for x in xs:
+                            idxs.append(y * side + x + offset)
+                    continue
             si = point_to_idx.get(name)
             if si is None:
                 continue
@@ -684,6 +702,545 @@ class BisheMethodV2StageStrategy(BisheMethodV2Strategy):
             "qk_mix": 0.20,
             "pos_mix": 0.04,
         }
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst")
+class BisheMethodV2StageAnchor16LiteFirstStrategy(BisheMethodV2StageStrategy):
+    """Ours variant with denser spatial anchors and a gentler first merge stage.
+
+    Design:
+    - 16 anchors from a 4x4 spatial grid, so the first stage keeps broader coverage.
+    - Slightly stronger position prior than the default v2stage.
+    - First stage merges fewer tokens; later stages finish the compression to 96.
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                # 576 -> 384 -> 240 -> 144 -> 96
+                "merge_steps": [(192, 192), (144, 144), (96, 96), (48, 48)],
+                "anchor_points": ["grid4x4"],
+                "protected_penalty": 0.09,
+                "qk_mix": 0.20,
+                "pos_mix": 0.05,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor9_litefirst")
+class BisheMethodV2StageAnchor9LiteFirstStrategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["anchor_points"] = ["grid3x3"]
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor36_litefirst")
+class BisheMethodV2StageAnchor36LiteFirstStrategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["anchor_points"] = ["grid6x6"]
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor49_litefirst")
+class BisheMethodV2StageAnchor49LiteFirstStrategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["anchor_points"] = ["grid7x7"]
+        return cfg
+
+
+# =========================
+# Anchor16 Base Extensions
+# =========================
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_t288")
+class BisheMethodV2StageAnchor16LiteFirst288Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(192, 192), (96, 96)]  # 576 -> 384 -> 288
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_t192")
+class BisheMethodV2StageAnchor16LiteFirst192Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(192, 192), (96, 96), (96, 96)]  # 576 -> 384 -> 288 -> 192
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_t144")
+class BisheMethodV2StageAnchor16LiteFirst144Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(192, 192), (96, 96), (96, 96), (48, 48)]  # 576 -> 384 -> 288 -> 192 -> 144
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_t64")
+class BisheMethodV2StageAnchor16LiteFirst64Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(192, 192), (144, 144), (96, 96), (64, 64), (16, 16)]  # 576 -> 384 -> 240 -> 144 -> 80 -> 64
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_t32")
+class BisheMethodV2StageAnchor16LiteFirst32Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(192, 192), (144, 144), (96, 96), (64, 64), (32, 32), (16, 16)]  # 576 -> 384 -> 240 -> 144 -> 80 -> 48 -> 32
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_a3_q010")
+class BisheMethodV2StageAnchor16LiteFirstA3Q010Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["qk_mix"] = 0.10
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_a3_q030")
+class BisheMethodV2StageAnchor16LiteFirstA3Q030Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["qk_mix"] = 0.30
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_a3_p000")
+class BisheMethodV2StageAnchor16LiteFirstA3P000Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["pos_mix"] = 0.00
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_a3_p002")
+class BisheMethodV2StageAnchor16LiteFirstA3P002Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["pos_mix"] = 0.02
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_a3_p008")
+class BisheMethodV2StageAnchor16LiteFirstA3P008Strategy(BisheMethodV2StageAnchor16LiteFirstStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["pos_mix"] = 0.08
+        return cfg
+
+
+# =========================
+# Ablation 1: Metric Switch
+# =========================
+# A1-a: All-S1 (use the Stage-1 composite metric for all merge stages)
+# A1-b: All-S2 (use the Stage-2 metric for all merge stages)
+# A1-c: Ours (stage-aware) -> `bishemethod_v2stage`
+
+
+@register_strategy("bishemethod_v2stage_a1_all_s1")
+class BisheMethodV2StageA1AllS1Strategy(BisheMethodV2Strategy):
+    """Ablation1 A1-a (All-S1).
+
+    Use the same composite (q/k + optional pos) metric across all merge stages.
+    This is equivalent to "no stage switch" under the v2 backbone.
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        # Match the default hyperparams of `bishemethod_v2stage` so ablation only changes stage switching.
+        return {
+            "merge_steps": [(272, 272), (148, 148), (60, 60)],  # 576 -> 96
+            "anchor_points": ["tl", "tr", "bl", "br", "center"],
+            "protected_penalty": 0.07,
+            "qk_mix": 0.20,
+            "pos_mix": 0.04,
+        }
+
+
+@register_strategy("bishemethod_v2stage_a1_all_s2")
+class BisheMethodV2StageA1AllS2Strategy(BisheMethodSoftStrategy):
+    """Ablation1 A1-b (All-S2).
+
+    Use the Stage-2 metric for all merge stages. In this repo's implementation,
+    Stage-2 corresponds to using the merged image features as the matching metric
+    (i.e. no q/k mixing and no position augmentation).
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        return {
+            "merge_steps": [(272, 272), (148, 148), (60, 60)],  # 576 -> 96
+            "anchor_points": ["tl", "tr", "bl", "br", "center"],
+            "protected_penalty": 0.07,
+        }
+
+    def apply(self, model: nn.Module, images: torch.Tensor, image_features: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.bipartite_merge is None:
+            raise RuntimeError("bishemethod_v2stage_a1_all_s2 requires bipartite_soft_matching_merge to be available")
+
+        # Stage-2 metric: use features directly as the matching metric.
+        metric = image_features
+
+        orig_num = image_features.shape[1]
+        protected_idx = self._anchor_indices(orig_num, image_features.device)
+
+        first = True
+        for r_feat, r_metric in self.config.get("merge_steps", [(272, 272), (148, 148), (60, 60)]):
+            if r_feat <= 0 or r_metric <= 0:
+                continue
+            if image_features.shape[1] <= 1 or metric.shape[1] <= 1:
+                break
+
+            kwargs_merge = {}
+            if first and protected_idx.numel() > 0:
+                kwargs_merge = {"protected_idx": protected_idx, "protected_penalty": self.protected_penalty}
+
+            merged_feat = self.bipartite_merge(metric=metric, r=r_feat, x=image_features, **kwargs_merge)
+            if merged_feat is None:
+                break
+
+            # Keep the metric consistent with "Stage-2": always use merged features.
+            image_features = merged_feat
+            metric = image_features
+            first = False
+
+        return image_features
+
+
+def _coerce_metric_to_image_tokens(metric: Optional[torch.Tensor], image_features: torch.Tensor) -> torch.Tensor:
+    """Align a candidate metric tensor to the image feature token layout."""
+    if metric is None:
+        return image_features
+    if metric.shape[1] == image_features.shape[1] + 1:
+        metric = metric[:, 1:, :]
+    if metric.shape[1] != image_features.shape[1]:
+        return image_features
+    return metric
+
+
+def _extract_qk_tensors(
+    model: nn.Module,
+    images: torch.Tensor,
+    image_features: torch.Tensor,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Collect q/k projections from the penultimate CLIP layer for ablation metrics."""
+    q = None
+    k = None
+    if model is None or images is None:
+        return q, k
+
+    try:
+        if isinstance(images, list) and len(images) > 0:
+            images = images[0]
+        if isinstance(images, torch.Tensor) and images.dim() == 3:
+            images = images.unsqueeze(0)
+
+        if isinstance(images, torch.Tensor) and images.dim() == 4:
+            vision_tower = getattr(model, "vision_tower", None)
+            inner = getattr(vision_tower, "vision_tower", vision_tower)
+            vision_model = getattr(inner, "vision_model", None)
+            if vision_model is not None:
+                outputs = {}
+
+                def hook_k(module, input, output):
+                    outputs["desired_k"] = output
+
+                def hook_q(module, input, output):
+                    outputs["desired_q"] = output
+
+                layers = vision_model.encoder.layers
+                hk = layers[-2].self_attn.k_proj.register_forward_hook(hook_k)
+                hq = layers[-2].self_attn.q_proj.register_forward_hook(hook_q)
+                _ = inner(images.to(device=vision_tower.device, dtype=vision_tower.dtype), output_hidden_states=True)
+                hk.remove()
+                hq.remove()
+                k = outputs.get("desired_k", None)
+                q = outputs.get("desired_q", None)
+    except Exception:
+        q = None
+        k = None
+
+    q = _coerce_metric_to_image_tokens(q, image_features) if q is not None else None
+    k = _coerce_metric_to_image_tokens(k, image_features) if k is not None else None
+    return q, k
+
+
+def _scalar_metric_from_values(values: torch.Tensor, image_features: torch.Tensor) -> torch.Tensor:
+    """Convert a scalar per-token score into a cosine-comparable token metric."""
+    values = torch.nan_to_num(values.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    mean = values.mean(dim=1, keepdim=True)
+    std = values.std(dim=1, keepdim=True).clamp_min(1e-6)
+    z = ((values - mean) / std).clamp(-10.0, 10.0)
+    ones = torch.ones_like(z)
+    metric = torch.cat([z, ones], dim=-1)
+    return metric.to(device=image_features.device, dtype=image_features.dtype)
+
+
+def _build_attention_only_metric(
+    q: Optional[torch.Tensor],
+    k: Optional[torch.Tensor],
+    image_features: torch.Tensor,
+) -> torch.Tensor:
+    """Use token attention profiles as the Stage-1 metric."""
+    if q is None or k is None or q.shape != k.shape:
+        return image_features
+
+    qf = torch.nan_to_num(q.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    kf = torch.nan_to_num(k.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    scale = 1.0 / max(qf.shape[-1] ** 0.5, 1.0)
+    attn = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    attn = torch.softmax(attn, dim=-1)
+    return attn.to(device=image_features.device, dtype=image_features.dtype)
+
+
+def _build_key_norm_only_metric(
+    k: Optional[torch.Tensor],
+    image_features: torch.Tensor,
+) -> torch.Tensor:
+    """Use only the per-token key norm as the Stage-1 signal."""
+    if k is None:
+        return image_features
+    key_norm = torch.norm(k.float(), dim=-1, keepdim=True)
+    return _scalar_metric_from_values(key_norm, image_features)
+
+
+def _build_position_only_metric(
+    strategy: "BisheMethodV2StageStrategy",
+    image_features: torch.Tensor,
+) -> torch.Tensor:
+    """Use only the 2D spatial code as the Stage-1 signal."""
+    pos_code = strategy._build_pos_code(image_features.shape[1], image_features.device, image_features.dtype)
+    if pos_code is None:
+        return image_features
+    return pos_code.unsqueeze(0).expand(image_features.shape[0], -1, -1)
+
+
+def _build_cls_similarity_metric(
+    image_features: torch.Tensor,
+) -> torch.Tensor:
+    """Approximate CLS-similarity using a global pooled pseudo-CLS token."""
+    proto = image_features.float().mean(dim=1, keepdim=True)
+    proto = torch.nn.functional.normalize(proto, p=2, dim=-1)
+    feats = torch.nn.functional.normalize(image_features.float(), p=2, dim=-1)
+    sim = torch.matmul(feats, proto.transpose(-1, -2))
+    return _scalar_metric_from_values(sim, image_features)
+
+
+def _run_stage1_metric_ablation(
+    strategy: "BisheMethodV2StageStrategy",
+    image_features: torch.Tensor,
+    stage1_metric: torch.Tensor,
+    debug_name: str,
+) -> torch.Tensor:
+    """Run the default 3-stage merge, but only replace the Stage-1 metric."""
+    if strategy.bipartite_merge is None:
+        raise RuntimeError(f"{debug_name} requires bipartite_soft_matching_merge to be available")
+
+    metric = _coerce_metric_to_image_tokens(stage1_metric, image_features)
+    orig_num = image_features.shape[1]
+    protected_idx = strategy._anchor_indices(orig_num, image_features.device)
+
+    first = True
+    for r_feat, r_metric in strategy.config.get("merge_steps", [(272, 272), (148, 148), (60, 60)]):
+        if r_feat <= 0 or r_metric <= 0:
+            continue
+        if image_features.shape[1] <= 1 or metric.shape[1] <= 1:
+            break
+
+        kwargs_merge = {}
+        if first and protected_idx.numel() > 0:
+            kwargs_merge = {
+                "protected_idx": protected_idx,
+                "protected_penalty": strategy.protected_penalty,
+            }
+
+        merged_feat = strategy.bipartite_merge(metric=metric, r=r_feat, x=image_features, **kwargs_merge)
+        if merged_feat is None:
+            break
+
+        merged_metric = strategy.bipartite_merge(metric=metric, r=r_metric, x=metric, **kwargs_merge)
+        image_features = merged_feat
+        if first:
+            metric = image_features
+        else:
+            metric = merged_metric if merged_metric is not None and merged_metric.shape[1] == image_features.shape[1] else image_features
+        first = False
+
+    if image_features.shape[1] != orig_num:
+        print(f"{debug_name} merged tokens: {orig_num} -> {image_features.shape[1]}")
+    return image_features
+
+
+# =========================
+# Ablation 2: Soft Anchor Lambda
+# =========================
+
+
+@register_strategy("bishemethod_v2stage_a2_lambda_000")
+class BisheMethodV2StageA2Lambda000Strategy(BisheMethodV2StageStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["protected_penalty"] = 0.00
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_a2_lambda_003")
+class BisheMethodV2StageA2Lambda003Strategy(BisheMethodV2StageStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["protected_penalty"] = 0.03
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_a2_lambda_005")
+class BisheMethodV2StageA2Lambda005Strategy(BisheMethodV2StageStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["protected_penalty"] = 0.05
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_a2_lambda_010")
+class BisheMethodV2StageA2Lambda010Strategy(BisheMethodV2StageStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["protected_penalty"] = 0.10
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_a2_lambda_015")
+class BisheMethodV2StageA2Lambda015Strategy(BisheMethodV2StageStrategy):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["protected_penalty"] = 0.15
+        return cfg
+
+
+# =========================
+# Ablation 5: Stage-1 Metric Comparisons
+# =========================
+
+
+@register_strategy("bishemethod_v2stage_a5_attn_only")
+class BisheMethodV2StageA5AttnOnlyStrategy(BisheMethodV2StageStrategy):
+    """A5-a: Stage-1 uses only attention profiles; later stages stay unchanged."""
+
+    def apply(self, model: nn.Module, images: torch.Tensor, image_features: torch.Tensor, **kwargs) -> torch.Tensor:
+        q, k = _extract_qk_tensors(model, images, image_features)
+        stage1_metric = _build_attention_only_metric(q, k, image_features)
+        return _run_stage1_metric_ablation(self, image_features, stage1_metric, "BisheMethodV2StageA5AttnOnly")
+
+
+@register_strategy("bishemethod_v2stage_a5_keynorm_only")
+class BisheMethodV2StageA5KeyNormOnlyStrategy(BisheMethodV2StageStrategy):
+    """A5-b: Stage-1 uses only key norm."""
+
+    def apply(self, model: nn.Module, images: torch.Tensor, image_features: torch.Tensor, **kwargs) -> torch.Tensor:
+        _, k = _extract_qk_tensors(model, images, image_features)
+        stage1_metric = _build_key_norm_only_metric(k, image_features)
+        return _run_stage1_metric_ablation(self, image_features, stage1_metric, "BisheMethodV2StageA5KeyNormOnly")
+
+
+@register_strategy("bishemethod_v2stage_a5_position_only")
+class BisheMethodV2StageA5PositionOnlyStrategy(BisheMethodV2StageStrategy):
+    """A5-c: Stage-1 uses only spatial position code."""
+
+    def apply(self, model: nn.Module, images: torch.Tensor, image_features: torch.Tensor, **kwargs) -> torch.Tensor:
+        stage1_metric = _build_position_only_metric(self, image_features)
+        return _run_stage1_metric_ablation(self, image_features, stage1_metric, "BisheMethodV2StageA5PositionOnly")
+
+
+@register_strategy("bishemethod_v2stage_a5_clssim")
+class BisheMethodV2StageA5CLSSimStrategy(BisheMethodV2StageStrategy):
+    """A5-d: Stage-1 uses pseudo-CLS similarity."""
+
+    def apply(self, model: nn.Module, images: torch.Tensor, image_features: torch.Tensor, **kwargs) -> torch.Tensor:
+        stage1_metric = _build_cls_similarity_metric(image_features)
+        return _run_stage1_metric_ablation(self, image_features, stage1_metric, "BisheMethodV2StageA5CLSSim")
+
+
+@register_strategy("bishemethod_v2stage_192")
+class BisheMethodV2Stage192Strategy(BisheMethodV2StageStrategy):
+    """BisheMethod v2stage budget=192 tokens.
+
+    Schedule: 576 -> 304 -> 192
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(272, 272), (112, 112)]
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_144")
+class BisheMethodV2Stage144Strategy(BisheMethodV2StageStrategy):
+    """BisheMethod v2stage budget=144 tokens.
+
+    Schedule: 576 -> 304 -> 152 -> 144
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(272, 272), (152, 152), (8, 8)]
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_64")
+class BisheMethodV2Stage64Strategy(BisheMethodV2StageStrategy):
+    """BisheMethod v2stage budget=64 tokens.
+
+    Schedule: 576 -> 304 -> 152 -> 76 -> 64
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(272, 272), (152, 152), (76, 76), (12, 12)]
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_32")
+class BisheMethodV2Stage32Strategy(BisheMethodV2StageStrategy):
+    """BisheMethod v2stage budget=32 tokens.
+
+    Schedule: 576 -> 304 -> 152 -> 76 -> 38 -> 32
+    """
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["merge_steps"] = [(272, 272), (152, 152), (76, 76), (38, 38), (6, 6)]
+        return cfg
 
 
 @register_strategy("prumerge_advanced")

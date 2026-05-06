@@ -11,19 +11,24 @@ TASK="${TASK:-gqa}"                     # gqa | vqav2_val | textvqa_val | pope |
 STRATEGY="${STRATEGY:-visionzipplus}"   # visionzip | visionzipplus
 LIMIT="${LIMIT:-10}"                    # number of samples, or "none"/0 for full run
 BATCH_SIZE="${BATCH_SIZE:-1}"           # lmms-eval batch size passed to model.generate
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}" # eager | sdpa | flash_attention_2
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="/mlx_devbox/users/quyanyi/playground/AIM/logs/${TASK}_limit${LIMIT}_${STRATEGY}_${TS}"
 
 # Match run_llava15_benchmarks.sh cache layout for datasets/hub.
-CACHE_ROOT="${CACHE_ROOT:-/tmp/aim_hf_home}"
+CACHE_ROOT="${CACHE_ROOT:-/mlx_devbox/users/quyanyi/playground/AIM/hf_cache_shared}"
 export HF_HOME="$CACHE_ROOT"
 export HF_DATASETS_CACHE="$CACHE_ROOT/datasets"
 
-# Force model/vision-tower weights to the repo-local hub cache (avoid re-downloads).
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-export HF_HUB_CACHE="/mlx_devbox/users/quyanyi/playground/AIM"
+# Force model/vision-tower weights to the local hub cache (fastest). You can override from env.
+export HF_ENDPOINT="${HF_ENDPOINT:-http://huggingface-proxy-sg.byted.org}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$CACHE_ROOT/hub}"
 export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
 export TRANSFORMERS_CACHE="$HF_HUB_CACHE"
+
+# Some datasets/configs use `token: True` in datasets.load_dataset(). huggingface_hub
+# primarily reads HF_TOKEN; allow users to provide only HUGGINGFACE_HUB_TOKEN as well.
+export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
 export HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-http://sys-proxy-rd-relay.byted.org:8118}}"
 export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-http://sys-proxy-rd-relay.byted.org:8118}}"
 export http_proxy="${http_proxy:-$HTTP_PROXY}"
@@ -39,7 +44,7 @@ export PYTHONUNBUFFERED=1
 export TRITON_CACHE_DIR="/tmp/triton_cache"
 mkdir -p "$TRITON_CACHE_DIR" "$OUT_DIR"
 
-MODEL_ARGS="pretrained=liuhaotian/llava-v1.5-7b,conv_template=vicuna_v1,attn_implementation=eager,token_prune_strategy=${STRATEGY}"
+MODEL_ARGS="pretrained=liuhaotian/llava-v1.5-7b,conv_template=vicuna_v1,attn_implementation=${ATTN_IMPLEMENTATION},token_prune_strategy=${STRATEGY}"
 
 echo "OUT_DIR=$OUT_DIR"
 echo "HF_HUB_CACHE=$HF_HUB_CACHE"
@@ -51,7 +56,7 @@ echo "BATCH_SIZE=$BATCH_SIZE"
 
 run_eval () {
   # Build args late so STRATEGY can be overridden from env.
-  MODEL_ARGS="pretrained=liuhaotian/llava-v1.5-7b,conv_template=vicuna_v1,attn_implementation=eager,token_prune_strategy=${STRATEGY}"
+  MODEL_ARGS="pretrained=liuhaotian/llava-v1.5-7b,conv_template=vicuna_v1,attn_implementation=${ATTN_IMPLEMENTATION},token_prune_strategy=${STRATEGY}"
 
   echo "---- Running lmms_eval (task=$TASK, limit=$LIMIT, strategy=$STRATEGY) ----"
   if [ "$LIMIT" = "0" ] || [ "$LIMIT" = "none" ]; then
@@ -107,6 +112,20 @@ PY
 }
 
 LOG_FILE="$OUT_DIR/run.log"
+
+# Preflight: verify flash-attn import when requested.
+if [ "$ATTN_IMPLEMENTATION" = "flash_attention_2" ]; then
+  echo "---- Preflight: checking flash_attn ----"
+  "$PYTHON" - <<'PY'
+import sys
+try:
+    import flash_attn  # noqa: F401
+    print("flash_attn=OK")
+except Exception as e:
+    print("flash_attn=FAIL:", repr(e))
+    sys.exit(2)
+PY
+fi
 
 # Always run online for datasets, but still keep model weights local via HF_HUB_CACHE.
 # Also cleanup any broken ".incomplete" dataset dirs from previous interrupted downloads.

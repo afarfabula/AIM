@@ -385,11 +385,10 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         eval_logger.info(f"Including path: {args.include_path}")
     task_manager = TaskManager(args.verbosity, include_path=args.include_path, model_name=args.model)
 
-    # update the evaluation tracker args with the output path and the HF token
+    # update the evaluation tracker args with the output path.
+    # NOTE: Do NOT record HF_TOKEN in logs/tracking args to avoid leaking secrets.
     if args.output_path:
         args.hf_hub_log_args += f",output_path={args.output_path}"
-    if os.environ.get("HF_TOKEN", None):
-        args.hf_hub_log_args += f",token={os.environ.get('HF_TOKEN')}"
 
     evaluation_tracker_args = simple_parse_args_string(args.hf_hub_log_args)
     eval_logger.info(f"Evaluation tracker args: {evaluation_tracker_args}")

@@ -3,6 +3,10 @@ __pycache__
 *.pyc
 *.egg-info
 dist
+.venv_qwen3/
+.locks/
+hf_cache_shared/
+models--*/
 
 # Log
 *.log
