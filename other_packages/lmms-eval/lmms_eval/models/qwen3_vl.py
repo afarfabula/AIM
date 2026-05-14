@@ -1,4 +1,7 @@
 import base64
+import json
+import os
+import urllib.request
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
@@ -6,6 +9,7 @@ import decord
 import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
+from huggingface_hub import snapshot_download
 from loguru import logger as eval_logger
 from PIL import Image
 from tqdm import tqdm
@@ -38,6 +42,51 @@ def _choose_qwen3_model_cls(pretrained: str):
     return Qwen3VLForConditionalGeneration
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prefetch_qwen3_snapshot(pretrained: str) -> str:
+    if os.path.isdir(pretrained):
+        return pretrained
+
+    cache_dir = os.getenv("HF_HUB_CACHE") or os.getenv("HF_HOME")
+    endpoint = os.getenv("HF_ENDPOINT")
+    max_workers = int(os.getenv("QWEN3_MODEL_SNAPSHOT_MAX_WORKERS", "1"))
+    force_download = _env_flag("QWEN3_MODEL_FORCE_DOWNLOAD", False)
+    resume_download = not _env_flag("QWEN3_MODEL_DISABLE_RESUME", False)
+
+    try:
+        return snapshot_download(
+            repo_id=pretrained,
+            cache_dir=cache_dir,
+            endpoint=endpoint,
+            resume_download=resume_download,
+            force_download=force_download,
+            max_workers=max_workers,
+            etag_timeout=60,
+        )
+    except Exception as e:
+        if "Consistency check failed" not in str(e):
+            raise
+        eval_logger.warning(
+            "Qwen3 model snapshot download hit consistency check failure; retrying with force_download=True, "
+            "resume_download=False, max_workers=1"
+        )
+        return snapshot_download(
+            repo_id=pretrained,
+            cache_dir=cache_dir,
+            endpoint=endpoint,
+            resume_download=False,
+            force_download=True,
+            max_workers=1,
+            etag_timeout=60,
+        )
+
+
 @register_model("qwen3_vl")
 class Qwen3_VL(lmms):
     """
@@ -53,6 +102,7 @@ class Qwen3_VL(lmms):
         use_cache: bool = True,
         use_flash_attention_2: Optional[bool] = False,
         attn_implementation: Optional[str] = None,
+        dtype: Optional[str] = None,
         max_pixels: int = 256 * 28 * 28,
         min_pixels: int = 3136,
         max_num_frames: int = 32,
@@ -82,17 +132,25 @@ class Qwen3_VL(lmms):
         if attn_implementation is None and use_flash_attention_2:
             attn_implementation = "flash_attention_2"
 
-        model_cls = _choose_qwen3_model_cls(pretrained)
+        resolved_pretrained = _prefetch_qwen3_snapshot(pretrained)
+        model_cls = _choose_qwen3_model_cls(resolved_pretrained)
+        # Qwen3-VL is published in bf16, and `dtype=auto` was enough to trigger
+        # SIGFPE during greedy generation on this worker for both FA2 and SDPA.
+        if dtype is None and self._device.type == "cuda":
+            dtype = "bfloat16"
         model_kwargs = {
-            "torch_dtype": "auto",
             "device_map": self.device_map,
         }
+        if dtype is None or dtype == "auto":
+            model_kwargs["dtype"] = "auto"
+        else:
+            model_kwargs["dtype"] = getattr(torch, dtype)
         if attn_implementation:
             model_kwargs["attn_implementation"] = attn_implementation
-        self._model = model_cls.from_pretrained(pretrained, **model_kwargs).eval()
+        self._model = model_cls.from_pretrained(resolved_pretrained, **model_kwargs).eval()
 
-        self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
-        self._tokenizer = getattr(self.processor, "tokenizer", None) or AutoTokenizer.from_pretrained(pretrained)
+        self.processor = AutoProcessor.from_pretrained(resolved_pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
+        self._tokenizer = getattr(self.processor, "tokenizer", None) or AutoTokenizer.from_pretrained(resolved_pretrained)
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
         self.max_num_frames = max_num_frames
@@ -193,6 +251,9 @@ class Qwen3_VL(lmms):
             visuals = [self._normalize_visuals(doc_to_visual[0](self.task_dict[task][split][ids])) for ids in doc_id]
             gen_kwargs = all_gen_kwargs[0].copy()
             until = [self.tokenizer.decode(self.eot_token_id)]
+            # #region debug-point A:batch-entry
+            exec("try:\n _p='/mlx_devbox/users/quyanyi/playground/AIM/.dbg/qwen3-gqa-fpe.env'; _u,_s='http://127.0.0.1:7777/event','qwen3-gqa-fpe';\n with open(_p) as _f: _c=_f.read(); _u=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\n urllib.request.urlopen(urllib.request.Request(_u,data=json.dumps({'sessionId':_s,'runId':'pre-fix','hypothesisId':'A','location':'qwen3_vl.py:242','msg':'[DEBUG] qwen3 generate batch entry','data':{'task':task,'split':split,'batch_size':len(contexts),'visual_types':[type(v).__name__ for v in visuals],'gen_kwargs_raw':{k:repr(v) for k,v in gen_kwargs.items()}}}).encode(),headers={'Content-Type':'application/json'}), timeout=1).read()\nexcept Exception:\n pass")
+            # #endregion
 
             if "until" in gen_kwargs:
                 until = gen_kwargs.pop("until")
@@ -260,6 +321,9 @@ class Qwen3_VL(lmms):
                 inputs = inputs.to("cuda")
             else:
                 inputs = inputs.to(self.device)
+            # #region debug-point C:inputs-ready
+            exec("try:\n _p='/mlx_devbox/users/quyanyi/playground/AIM/.dbg/qwen3-gqa-fpe.env'; _u,_s='http://127.0.0.1:7777/event','qwen3-gqa-fpe';\n with open(_p) as _f: _c=_f.read(); _u=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\n _data={};\n _ids=getattr(inputs,'input_ids',None); _mask=getattr(inputs,'attention_mask',None); _pix=getattr(inputs,'pixel_values',None); _grid=getattr(inputs,'image_grid_thw',None);\n _data.update({'input_ids_shape':list(_ids.shape) if _ids is not None else None,'attention_mask_shape':list(_mask.shape) if _mask is not None else None,'pixel_values_shape':list(_pix.shape) if _pix is not None else None,'pixel_values_dtype':str(_pix.dtype) if _pix is not None else None,'pixel_values_device':str(_pix.device) if _pix is not None else None,'image_grid_thw':_grid.tolist() if _grid is not None else None,'image_inputs_count':len(image_inputs) if image_inputs is not None else 0,'video_inputs_count':len(video_inputs) if video_inputs is not None else 0});\n urllib.request.urlopen(urllib.request.Request(_u,data=json.dumps({'sessionId':_s,'runId':'pre-fix','hypothesisId':'C','location':'qwen3_vl.py:310','msg':'[DEBUG] qwen3 inputs ready','data':_data}).encode(),headers={'Content-Type':'application/json'}), timeout=1).read()\nexcept Exception:\n pass")
+            # #endregion
 
             if "max_new_tokens" not in gen_kwargs:
                 gen_kwargs["max_new_tokens"] = 128
@@ -269,18 +333,25 @@ class Qwen3_VL(lmms):
                 gen_kwargs["top_p"] = None
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
+            # #region debug-point B:before-generate
+            exec("try:\n _p='/mlx_devbox/users/quyanyi/playground/AIM/.dbg/qwen3-gqa-fpe.env'; _u,_s='http://127.0.0.1:7777/event','qwen3-gqa-fpe';\n with open(_p) as _f: _c=_f.read(); _u=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\n urllib.request.urlopen(urllib.request.Request(_u,data=json.dumps({'sessionId':_s,'runId':'pre-fix','hypothesisId':'B','location':'qwen3_vl.py:320','msg':'[DEBUG] qwen3 before generate','data':{'do_sample':bool(gen_kwargs['temperature'] > 0),'temperature':repr(gen_kwargs['temperature']),'top_p':repr(gen_kwargs['top_p']),'num_beams':repr(gen_kwargs['num_beams']),'max_new_tokens':repr(gen_kwargs['max_new_tokens']),'model_dtype':str(getattr(self.model,'dtype',None)),'model_device':str(self.device),'use_cache':self.use_cache}}).encode(),headers={'Content-Type':'application/json'}), timeout=1).read()\nexcept Exception:\n pass")
+            # #endregion
 
-            cont = self.model.generate(
-                **inputs,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
-                do_sample=bool(gen_kwargs["temperature"] > 0),
-                temperature=gen_kwargs["temperature"],
-                top_p=gen_kwargs["top_p"],
-                num_beams=gen_kwargs["num_beams"],
-                max_new_tokens=gen_kwargs["max_new_tokens"],
-                use_cache=self.use_cache,
-            )
+            generate_kwargs = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "do_sample": bool(gen_kwargs["temperature"] > 0),
+                "num_beams": gen_kwargs["num_beams"],
+                "max_new_tokens": gen_kwargs["max_new_tokens"],
+                "use_cache": self.use_cache,
+            }
+            if generate_kwargs["do_sample"]:
+                generate_kwargs["temperature"] = gen_kwargs["temperature"]
+                generate_kwargs["top_p"] = gen_kwargs["top_p"]
+            cont = self.model.generate(**inputs, **generate_kwargs)
+            # #region debug-point D:after-generate
+            exec("try:\n _p='/mlx_devbox/users/quyanyi/playground/AIM/.dbg/qwen3-gqa-fpe.env'; _u,_s='http://127.0.0.1:7777/event','qwen3-gqa-fpe';\n with open(_p) as _f: _c=_f.read(); _u=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in _c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\n urllib.request.urlopen(urllib.request.Request(_u,data=json.dumps({'sessionId':_s,'runId':'pre-fix','hypothesisId':'D','location':'qwen3_vl.py:332','msg':'[DEBUG] qwen3 after generate','data':{'cont_shape':list(cont.shape) if hasattr(cont,'shape') else None}}).encode(),headers={'Content-Type':'application/json'}), timeout=1).read()\nexcept Exception:\n pass")
+            # #endregion
 
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
             answers = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)

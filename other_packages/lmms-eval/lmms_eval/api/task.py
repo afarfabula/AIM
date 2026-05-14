@@ -898,7 +898,30 @@ class ConfigurableTask(Task):
                         **dataset_kwargs if dataset_kwargs is not None else {},
                     )
                     dataset_kwargs["From_YouTube"] = True
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset")  # download_parquet
+                    # NOTE: lmms-eval uses snapshot_download() to fetch some datasets. By default this goes to the
+                    # global HF hub cache, which might be on the system disk and can easily hit ENOSPC for large
+                    # video datasets. Allow overriding the dataset snapshot cache independently (e.g. to /tmp).
+                    dataset_snapshot_cache = os.getenv("LMMS_EVAL_DATASET_HUB_CACHE") or os.getenv("HF_DATASETS_CACHE")
+                    force_dl_env = os.getenv("LMMS_EVAL_DATASET_FORCE_DOWNLOAD", "0") == "1"
+                    try:
+                        cache_path = snapshot_download(
+                            repo_id=self.DATASET_PATH,
+                            repo_type="dataset",
+                            cache_dir=dataset_snapshot_cache,
+                            force_download=force_dl_env,
+                        )  # download_parquet
+                    except OSError as e:
+                        # If a large dataset download is interrupted, hf_hub can leave a truncated file behind
+                        # and future runs will fail the size consistency check. In that case retry with force.
+                        if "Consistency check failed" in str(e):
+                            cache_path = snapshot_download(
+                                repo_id=self.DATASET_PATH,
+                                repo_type="dataset",
+                                cache_dir=dataset_snapshot_cache,
+                                force_download=True,
+                            )
+                        else:
+                            raise
                     split = vars(self.config)["test_split"]
                     task = vars(self.config)["task"]
 
@@ -939,7 +962,42 @@ class ConfigurableTask(Task):
                     force_unzip = dataset_kwargs.get("force_unzip", False)
                     revision = dataset_kwargs.get("revision", "main")
                     create_link = dataset_kwargs.get("create_link", False)
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, revision=revision, repo_type="dataset", force_download=force_download, etag_timeout=60)
+                    dataset_snapshot_cache = os.getenv("LMMS_EVAL_DATASET_HUB_CACHE") or os.getenv("HF_DATASETS_CACHE")
+                    force_dl_env = os.getenv("LMMS_EVAL_DATASET_FORCE_DOWNLOAD", "0") == "1"
+                    endpoint = os.getenv("HF_ENDPOINT")
+                    max_workers = int(os.getenv("LMMS_EVAL_SNAPSHOT_MAX_WORKERS", "2"))
+                    do_force = force_download or force_dl_env
+                    resume = None if not do_force else False
+
+                    # Large video datasets can intermittently download truncated chunks via proxy/network.
+                    # Retry a few times, and after any consistency error: force re-download, disable resume,
+                    # and reduce concurrency to make downloads more stable.
+                    last_err = None
+                    for _attempt in range(3):
+                        try:
+                            cache_path = snapshot_download(
+                                repo_id=self.DATASET_PATH,
+                                revision=revision,
+                                repo_type="dataset",
+                                cache_dir=dataset_snapshot_cache,
+                                endpoint=endpoint,
+                                force_download=do_force,
+                                resume_download=resume,
+                                max_workers=max_workers,
+                                etag_timeout=60,
+                            )
+                            last_err = None
+                            break
+                        except OSError as e:
+                            last_err = e
+                            if "Consistency check failed" in str(e):
+                                do_force = True
+                                resume = False
+                                max_workers = 1
+                                continue
+                            raise
+                    if last_err is not None:
+                        raise last_err
                     # cache_path = self.DATASET_PATH
                     zip_files = glob(os.path.join(cache_path, "**/*.zip"), recursive=True)
                     tar_files = glob(os.path.join(cache_path, "**/*.tar*"), recursive=True)

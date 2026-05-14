@@ -17,11 +17,14 @@ OUT_DIR="/mlx_devbox/users/quyanyi/playground/AIM/logs/${TASK}_limit${LIMIT}_qwe
 CACHE_ROOT="${CACHE_ROOT:-/mlx_devbox/users/quyanyi/playground/AIM/hf_cache_shared}"
 export HF_HOME="$CACHE_ROOT"
 export HF_DATASETS_CACHE="$CACHE_ROOT/datasets"
-export HF_ENDPOINT="${HF_ENDPOINT:-http://huggingface-proxy-sg.byted.org}"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface-proxy-sg.byted.org}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$CACHE_ROOT/hub}"
 export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
-export TRANSFORMERS_CACHE="$HF_HUB_CACHE"
+HF_ENDPOINT="$(printf '%s' "$HF_ENDPOINT" | tr -d '`' | xargs)"
+export HF_ENDPOINT
+unset TRANSFORMERS_CACHE
 export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
+export QWEN3_MODEL_SNAPSHOT_MAX_WORKERS="${QWEN3_MODEL_SNAPSHOT_MAX_WORKERS:-1}"
 
 export HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-http://sys-proxy-rd-relay.byted.org:3128}}"
 export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-http://sys-proxy-rd-relay.byted.org:3128}}"
@@ -50,6 +53,7 @@ echo "LIMIT=$LIMIT"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo "MODEL_ARGS=$MODEL_ARGS"
 echo "HF_HUB_CACHE=$HF_HUB_CACHE"
+echo "QWEN3_MODEL_SNAPSHOT_MAX_WORKERS=$QWEN3_MODEL_SNAPSHOT_MAX_WORKERS"
 
 echo "---- Preflight: checking qwen3 imports ----"
 "$PYTHON" - <<'PY'

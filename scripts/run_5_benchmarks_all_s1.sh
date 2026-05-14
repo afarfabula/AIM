@@ -30,7 +30,13 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/triton_cache}"
 export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
 mkdir -p "$TRITON_CACHE_DIR"
 
-MODEL_NAME="${MODEL_NAME:-liuhaotian/llava-v1.5-7b}"
+LOCAL_LLAVA15_MODEL="${LOCAL_LLAVA15_MODEL:-$CACHE_ROOT/local_models/liuhaotian__llava-v1.5-7b}"
+if [ -d "$LOCAL_LLAVA15_MODEL" ]; then
+  DEFAULT_MODEL_NAME="$LOCAL_LLAVA15_MODEL"
+else
+  DEFAULT_MODEL_NAME="liuhaotian/llava-v1.5-7b"
+fi
+MODEL_NAME="${MODEL_NAME:-$DEFAULT_MODEL_NAME}"
 MODEL_ARGS="pretrained=${MODEL_NAME},conv_template=vicuna_v1,attn_implementation=${ATTN_IMPLEMENTATION},token_prune_strategy=${STRATEGY}"
 
 TASKS=(
@@ -46,6 +52,7 @@ echo "PYTHON=$PYTHON"
 echo "HF_ENDPOINT=$HF_ENDPOINT"
 echo "HF_HUB_CACHE=$HF_HUB_CACHE"
 echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
+echo "LOCAL_LLAVA15_MODEL=$LOCAL_LLAVA15_MODEL"
 echo "MODEL_ARGS=$MODEL_ARGS"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo "LIMIT=$LIMIT"

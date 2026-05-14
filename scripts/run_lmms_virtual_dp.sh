@@ -6,14 +6,20 @@ cd /mlx_devbox/users/quyanyi/playground/AIM
 PYTHON="${PYTHON:-/home/tiger/miniforge3/envs/aim/bin/python}"
 TASKS="${TASKS:-gqa}"
 MODEL="${MODEL:-llava}"
-MODEL_ARGS="${MODEL_ARGS:-pretrained=liuhaotian/llava-v1.5-7b,conv_template=vicuna_v1,attn_implementation=eager,token_prune_strategy=bishemethod_v2stage}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT="${LIMIT:-200}"
 VIRTUAL_WORLD_SIZE="${VIRTUAL_WORLD_SIZE:-2}"
-VIRTUAL_DEVICE="${VIRTUAL_DEVICE:-cuda:0}"
+VIRTUAL_DEVICE_BASE="${VIRTUAL_DEVICE_BASE:-cuda}"
 TS="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUN_DIR:-/mlx_devbox/users/quyanyi/playground/AIM/logs/virtual_dp_${TASKS//,/__}_${TS}}"
 CACHE_ROOT="${CACHE_ROOT:-/mlx_devbox/users/quyanyi/playground/AIM/hf_cache_shared}"
+LOCAL_LLAVA15_MODEL="${LOCAL_LLAVA15_MODEL:-$CACHE_ROOT/local_models/liuhaotian__llava-v1.5-7b}"
+if [ -d "$LOCAL_LLAVA15_MODEL" ]; then
+  DEFAULT_MODEL_NAME="$LOCAL_LLAVA15_MODEL"
+else
+  DEFAULT_MODEL_NAME="liuhaotian/llava-v1.5-7b"
+fi
+MODEL_ARGS="${MODEL_ARGS:-pretrained=${DEFAULT_MODEL_NAME},conv_template=vicuna_v1,attn_implementation=eager,token_prune_strategy=bishemethod_v2stage}"
 
 export http_proxy="${http_proxy:-http://sys-proxy-rd-relay.byted.org:3128}"
 export https_proxy="${https_proxy:-http://sys-proxy-rd-relay.byted.org:3128}"
@@ -41,13 +47,15 @@ echo "MODEL_ARGS=$MODEL_ARGS"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo "LIMIT=$LIMIT"
 echo "VIRTUAL_WORLD_SIZE=$VIRTUAL_WORLD_SIZE"
-echo "VIRTUAL_DEVICE=$VIRTUAL_DEVICE"
+echo "VIRTUAL_DEVICE_BASE=$VIRTUAL_DEVICE_BASE"
 echo "HF_HUB_CACHE=$HF_HUB_CACHE"
+echo "LOCAL_LLAVA15_MODEL=$LOCAL_LLAVA15_MODEL"
 
 pids=()
 for ((rank=0; rank<VIRTUAL_WORLD_SIZE; rank++)); do
   shard_dir="$RUN_DIR/shard_${rank}"
   mkdir -p "$shard_dir"
+  virtual_device="${VIRTUAL_DEVICE_BASE}:${rank}"
 
   cmd=(
     "$PYTHON" -m lmms_eval
@@ -59,14 +67,14 @@ for ((rank=0; rank<VIRTUAL_WORLD_SIZE; rank++)); do
     --log_samples
     --virtual_world_size "$VIRTUAL_WORLD_SIZE"
     --virtual_rank "$rank"
-    --virtual_device "$VIRTUAL_DEVICE"
+    --virtual_device "$virtual_device"
   )
 
   if [[ "$LIMIT" != "none" && "$LIMIT" != "0" ]]; then
     cmd+=(--limit "$LIMIT")
   fi
 
-  echo "Launching shard $rank -> $shard_dir"
+  echo "Launching shard $rank on $virtual_device -> $shard_dir"
   "${cmd[@]}" >"$shard_dir/run.log" 2>&1 &
   pids+=($!)
 done

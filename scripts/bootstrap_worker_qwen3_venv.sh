@@ -9,6 +9,7 @@ cd /mlx_devbox/users/quyanyi/playground/AIM
 VENV_DIR="${VENV_DIR:-/tmp/aim_qwen3_venv}"
 TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-transformers==4.57.1}"
 ACCELERATE_SPEC="${ACCELERATE_SPEC:-accelerate>=0.29.1}"
+unset TRANSFORMERS_CACHE
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "[venv] create $VENV_DIR (reuse system site-packages)"
