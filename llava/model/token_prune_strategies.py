@@ -704,6 +704,224 @@ class BisheMethodV2StageStrategy(BisheMethodV2Strategy):
         }
 
 
+class _AnchorAwareOrderMixin:
+    """Build anchor-aware token orders before bipartite split (a=even, b=odd).
+
+    Why:
+    - Current merge uses fixed even/odd split for source/target.
+    - If anchor tokens collapse to one parity side, protection can become asymmetric.
+    - This mixin injects a deterministic reorder step so anchors are distributed
+      across both source and target groups before each merge stage.
+    """
+
+    def _build_anchor_aware_order(
+        self,
+        num_tokens: int,
+        device: torch.device,
+        mode: str = "alternate",
+        group_size: int = 1,
+    ) -> Optional[torch.Tensor]:
+        if num_tokens <= 1:
+            return None
+
+        anchor_idx = self._anchor_indices(num_tokens, device)
+        if anchor_idx is None or anchor_idx.numel() == 0:
+            return None
+
+        all_idx = torch.arange(num_tokens, device=device, dtype=torch.long)
+        is_anchor = torch.zeros(num_tokens, device=device, dtype=torch.bool)
+        is_anchor[anchor_idx.clamp(min=0, max=num_tokens - 1)] = True
+
+        anchors = all_idx[is_anchor]
+        non_anchors = all_idx[~is_anchor]
+
+        if mode == "alternate":
+            # Interleave anchor and non-anchor to avoid parity collapse.
+            out = []
+            ia = 0
+            inon = 0
+            while ia < anchors.numel() or inon < non_anchors.numel():
+                if ia < anchors.numel():
+                    out.append(anchors[ia])
+                    ia += 1
+                if inon < non_anchors.numel():
+                    out.append(non_anchors[inon])
+                    inon += 1
+            return torch.stack(out) if len(out) > 0 else None
+
+        if mode == "balanced_pairs":
+            # Fill (even, odd) pairs so each pair tends to contain one anchor.
+            out = []
+            ia = 0
+            inon = 0
+            while ia < anchors.numel() or inon < non_anchors.numel():
+                if ia < anchors.numel():
+                    out.append(anchors[ia]); ia += 1
+                elif inon < non_anchors.numel():
+                    out.append(non_anchors[inon]); inon += 1
+
+                if inon < non_anchors.numel():
+                    out.append(non_anchors[inon]); inon += 1
+                elif ia < anchors.numel():
+                    out.append(anchors[ia]); ia += 1
+            return torch.stack(out) if len(out) > 0 else None
+
+        if mode == "block":
+            g = max(1, int(group_size))
+            out = []
+            ia = 0
+            inon = 0
+            while ia < anchors.numel() or inon < non_anchors.numel():
+                for _ in range(g):
+                    if ia < anchors.numel():
+                        out.append(anchors[ia]); ia += 1
+                for _ in range(g):
+                    if inon < non_anchors.numel():
+                        out.append(non_anchors[inon]); inon += 1
+            return torch.stack(out) if len(out) > 0 else None
+
+        return None
+
+
+class _AnchorAwareV2StageBase(_AnchorAwareOrderMixin, BisheMethodV2StageStrategy):
+    """Anchor-aware base: same v2stage-litefirst pipeline with custom pre-merge ordering."""
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.anchor_order_mode = config.get("anchor_order_mode", "alternate")
+        self.anchor_order_group_size = int(config.get("anchor_order_group_size", 1))
+        self.anchor_order_first_stage_only = bool(config.get("anchor_order_first_stage_only", True))
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                # Match the existing litefirst backbone.
+                "merge_steps": [(192, 192), (144, 144), (96, 96), (48, 48)],
+                "anchor_points": ["grid4x4"],
+                "protected_penalty": 0.09,
+                "qk_mix": 0.20,
+                "pos_mix": 0.05,
+                "target_total_tokens": 640,
+                "anchor_order_mode": "alternate",
+                "anchor_order_group_size": 1,
+                "anchor_order_first_stage_only": True,
+            }
+        )
+        return cfg
+
+    def apply(self, model: nn.Module, images: torch.Tensor, image_features: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.bipartite_merge is None:
+            raise RuntimeError("anchor-aware bishemethod requires bipartite_soft_matching_merge")
+
+        # --- Copy v2stage metric build path ---
+        metric_base = None
+        if model is not None and images is not None:
+            try:
+                if isinstance(images, list) and len(images) > 0:
+                    images = images[0]
+                if isinstance(images, torch.Tensor) and images.dim() == 3:
+                    images = images.unsqueeze(0)
+                if isinstance(images, torch.Tensor) and images.dim() == 4:
+                    vision_tower = getattr(model, "vision_tower", None)
+                    inner = getattr(vision_tower, "vision_tower", vision_tower)
+                    vision_model = getattr(inner, "vision_model", None)
+                    if vision_model is not None:
+                        outputs = {}
+
+                        def hook_k(module, input, output):
+                            outputs["desired_k"] = output
+
+                        def hook_q(module, input, output):
+                            outputs["desired_q"] = output
+
+                        layers = vision_model.encoder.layers
+                        hk = layers[-2].self_attn.k_proj.register_forward_hook(hook_k)
+                        hq = layers[-2].self_attn.q_proj.register_forward_hook(hook_q)
+                        _ = inner(images.to(device=vision_tower.device, dtype=vision_tower.dtype), output_hidden_states=True)
+                        hk.remove()
+                        hq.remove()
+                        k = outputs.get("desired_k", None)
+                        q = outputs.get("desired_q", None)
+                        if k is not None and q is not None and k.shape == q.shape:
+                            metric_base = (1.0 - self.qk_mix) * k + self.qk_mix * q
+                        else:
+                            metric_base = k if k is not None else q
+            except Exception:
+                metric_base = None
+
+        if metric_base is None:
+            metric_base = image_features
+        elif metric_base.shape[1] == image_features.shape[1] + 1:
+            metric_base = metric_base[:, 1:, :]
+        elif metric_base.shape[1] != image_features.shape[1]:
+            metric_base = image_features
+
+        pos_code = self._build_pos_code(metric_base.shape[1], metric_base.device, metric_base.dtype)
+        metric_first = metric_base
+        if pos_code is not None and self.pos_mix > 0:
+            pos_code = pos_code.unsqueeze(0).expand(metric_base.shape[0], -1, -1)
+            metric_first = torch.cat([metric_base, self.pos_mix * pos_code], dim=-1)
+
+        orig_num = image_features.shape[1]
+        protected_idx = self._anchor_indices(orig_num, image_features.device)
+
+        first = True
+        metric = metric_first
+        for r_feat, r_metric in self.config.get("merge_steps", [(192, 192), (144, 144), (96, 96), (48, 48)]):
+            if r_feat <= 0 or r_metric <= 0:
+                continue
+            if image_features.shape[1] <= 1 or metric.shape[1] <= 1:
+                break
+
+            kwargs_merge = {}
+            if first and protected_idx.numel() > 0:
+                kwargs_merge = {
+                    "protected_idx": protected_idx,
+                    "protected_penalty": self.protected_penalty,
+                }
+
+            token_order = None
+            if (first or (not self.anchor_order_first_stage_only)) and protected_idx.numel() > 0:
+                token_order = self._build_anchor_aware_order(
+                    num_tokens=image_features.shape[1],
+                    device=image_features.device,
+                    mode=self.anchor_order_mode,
+                    group_size=self.anchor_order_group_size,
+                )
+
+            merged_feat = self.bipartite_merge(
+                metric=metric,
+                r=r_feat,
+                x=image_features,
+                token_order=token_order,
+                **kwargs_merge,
+            )
+            if merged_feat is None:
+                break
+            merged_metric = self.bipartite_merge(
+                metric=metric,
+                r=r_metric,
+                x=metric,
+                token_order=token_order,
+                **kwargs_merge,
+            )
+            image_features = merged_feat
+            if first:
+                metric = image_features
+            else:
+                metric = merged_metric if merged_metric is not None and merged_metric.shape[1] == image_features.shape[1] else image_features
+            first = False
+
+        if image_features.shape[1] != orig_num:
+            print(
+                f"{self.__class__.__name__} merged tokens: {orig_num} -> {image_features.shape[1]} "
+                f"(order_mode={self.anchor_order_mode}, penalty={self.protected_penalty})"
+            )
+        return image_features
+
+
 @register_strategy("bishemethod_v2stage_anchor16_litefirst")
 class BisheMethodV2StageAnchor16LiteFirstStrategy(BisheMethodV2StageStrategy):
     """Ours variant with denser spatial anchors and a gentler first merge stage.
@@ -727,6 +945,324 @@ class BisheMethodV2StageAnchor16LiteFirstStrategy(BisheMethodV2StageStrategy):
                 "pos_mix": 0.05,
             }
         )
+        return cfg
+
+
+class _LlavaNextPerViewBudgetMixin:
+    """Per-view budgeted pruning for LLaVA-NeXT anyres inputs.
+
+    LLaVA-NeXT anyres first expands one image into multiple square views
+    (global resized view + local crops). For these inputs we want to keep
+    anchor coverage inside each view instead of pruning after the views have
+    already been spatially mixed together.
+    """
+
+    def _dynamic_merge_steps(self, num_tokens: int, target_keep: int):
+        steps = []
+        cur = int(num_tokens)
+        target_keep = max(1, min(int(target_keep), cur))
+        while cur > target_keep:
+            # bipartite merge can remove at most half of the current tokens.
+            r = min(cur // 2, cur - target_keep)
+            if r <= 0:
+                break
+            steps.append((r, r))
+            cur -= r
+        return steps
+
+    def apply_anyres_views_after_projector(self, image_features: torch.Tensor):
+        if not isinstance(image_features, torch.Tensor) or image_features.dim() != 3:
+            return [image_features]
+
+        num_views, num_tokens, _ = image_features.shape
+        target_total_tokens = int(self.config.get("target_total_tokens", num_views * 128))
+        base_keep = max(1, target_total_tokens // max(1, num_views))
+        remainder = max(0, target_total_tokens - base_keep * num_views)
+        outputs = []
+
+        original_merge_steps = self.config.get("merge_steps")
+        try:
+            for view_idx in range(num_views):
+                keep_this_view = base_keep + (1 if view_idx < remainder else 0)
+                keep_this_view = min(keep_this_view, num_tokens)
+                self.config["merge_steps"] = self._dynamic_merge_steps(num_tokens, keep_this_view)
+                view_out = super().apply(None, None, image_features[view_idx : view_idx + 1])
+                if isinstance(view_out, torch.Tensor) and view_out.dim() == 3 and view_out.shape[0] == 1:
+                    view_out = view_out.squeeze(0)
+                outputs.append(view_out)
+        finally:
+            self.config["merge_steps"] = original_merge_steps
+
+        kept_total = sum(x.shape[0] for x in outputs if isinstance(x, torch.Tensor) and x.dim() == 2)
+        print(
+            f"{self.__class__.__name__}: per-view anyres pruning "
+            f"{num_views}x{num_tokens} -> total {kept_total} tokens"
+        )
+        return outputs
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_next_t640")
+class BisheMethodV2StageAnchor16LiteFirstNext640Strategy(
+    _LlavaNextPerViewBudgetMixin, BisheMethodV2StageAnchor16LiteFirstStrategy
+):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["target_total_tokens"] = 640
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_next_t320")
+class BisheMethodV2StageAnchor16LiteFirstNext320Strategy(
+    _LlavaNextPerViewBudgetMixin, BisheMethodV2StageAnchor16LiteFirstStrategy
+):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["target_total_tokens"] = 320
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_litefirst_next_t160")
+class BisheMethodV2StageAnchor16LiteFirstNext160Strategy(
+    _LlavaNextPerViewBudgetMixin, BisheMethodV2StageAnchor16LiteFirstStrategy
+):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["target_total_tokens"] = 160
+        return cfg
+
+
+# =========================
+# Anchor-Aware Variants (10)
+# =========================
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v1")
+class BisheMethodV2StageAnchor16AwareV1Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Alternate anchor/non-anchor to avoid parity collapse (stage-1 only)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "alternate",
+                "anchor_order_first_stage_only": True,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v2")
+class BisheMethodV2StageAnchor16AwareV2Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Alternate ordering applied on every stage (strongest parity control)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "alternate",
+                "anchor_order_first_stage_only": False,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v3")
+class BisheMethodV2StageAnchor16AwareV3Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Balanced pairs: try to put anchors into even slots, non-anchors into odd slots."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "balanced_pairs",
+                "anchor_order_first_stage_only": True,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v4")
+class BisheMethodV2StageAnchor16AwareV4Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Balanced pairs + light protection (softer anchor bias)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "balanced_pairs",
+                "anchor_order_first_stage_only": True,
+                "protected_penalty": 0.05,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v5")
+class BisheMethodV2StageAnchor16AwareV5Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Block ordering g=2 (two anchors, two non-anchors)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "block",
+                "anchor_order_group_size": 2,
+                "anchor_order_first_stage_only": True,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v6")
+class BisheMethodV2StageAnchor16AwareV6Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Block ordering g=3 (stronger spatial grouping)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "block",
+                "anchor_order_group_size": 3,
+                "anchor_order_first_stage_only": True,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v7")
+class BisheMethodV2StageAnchor16AwareV7Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Alternate ordering + slightly stronger position mixing."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "alternate",
+                "anchor_order_first_stage_only": True,
+                "pos_mix": 0.08,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v8")
+class BisheMethodV2StageAnchor16AwareV8Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Alternate ordering + lower position prior (less geometric bias)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "alternate",
+                "anchor_order_first_stage_only": True,
+                "pos_mix": 0.02,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v9")
+class BisheMethodV2StageAnchor16AwareV9Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Alternate ordering + higher q/k mix (more query-aware)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "alternate",
+                "anchor_order_first_stage_only": True,
+                "qk_mix": 0.30,
+                "protected_penalty": 0.09,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v10")
+class BisheMethodV2StageAnchor16AwareV10Strategy(
+    _LlavaNextPerViewBudgetMixin, _AnchorAwareV2StageBase
+):
+    """Alternate ordering + lighter penalty (more merge freedom)."""
+
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg.update(
+            {
+                "anchor_order_mode": "alternate",
+                "anchor_order_first_stage_only": True,
+                "protected_penalty": 0.03,
+            }
+        )
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v6_next_t640")
+class BisheMethodV2StageAnchor16AwareV6Next640Strategy(
+    BisheMethodV2StageAnchor16AwareV6Strategy
+):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["target_total_tokens"] = 640
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v6_next_t320")
+class BisheMethodV2StageAnchor16AwareV6Next320Strategy(
+    BisheMethodV2StageAnchor16AwareV6Strategy
+):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["target_total_tokens"] = 320
+        return cfg
+
+
+@register_strategy("bishemethod_v2stage_anchor16_aware_v6_next_t160")
+class BisheMethodV2StageAnchor16AwareV6Next160Strategy(
+    BisheMethodV2StageAnchor16AwareV6Strategy
+):
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        cfg = super().get_default_config()
+        cfg["target_total_tokens"] = 160
         return cfg
 
 

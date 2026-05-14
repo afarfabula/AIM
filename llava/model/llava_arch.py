@@ -307,12 +307,16 @@ class LlavaMetaForCausalLM(ABC):
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat") # spatial_unpad
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square") # anyres_max_9
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token") # one_token
+            from llava.model.token_prune_strategies import get_global_strategy
+            strategy = get_global_strategy()
 
             if mm_patch_merge_type == "flat":
                 image_features = [x.flatten(0, 1) for x in image_features]
+                image_feature_strategy_applied = [False] * len(image_features)
 
             elif mm_patch_merge_type.startswith("spatial"):
                 new_image_features = []
+                image_feature_strategy_applied = []
                 for image_idx, image_feature in enumerate(image_features):
                     # FIXME: now assume the image is square, and split to 2x2 patches
                     # num_patches = h * w, where h = w = sqrt(num_patches)
@@ -353,9 +357,39 @@ class LlavaMetaForCausalLM(ABC):
                             new_image_features.append(image_feature)      
                         elif mm_newline_position == "no_token":
                             new_image_features.append(image_feature.flatten(0, 1))
+                            image_feature_strategy_applied.append(False)
                         else:
                             raise ValueError(f"Unexpected mm_newline_position: {mm_newline_position}")
+                        if len(image_feature_strategy_applied) < len(new_image_features):
+                            image_feature_strategy_applied.append(False)
                     elif image_feature.shape[0] > 1:  # multi patches and multi images operations
+                        if (
+                            strategy is not None
+                            and hasattr(strategy, "apply_anyres_views_after_projector")
+                            and (image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio)
+                        ):
+                            pruned_views = strategy.apply_anyres_views_after_projector(image_feature)
+                            if isinstance(pruned_views, list):
+                                flattened_views = []
+                                for pruned_view in pruned_views:
+                                    if pruned_view is None:
+                                        continue
+                                    if pruned_view.dim() == 3 and pruned_view.shape[0] == 1:
+                                        pruned_view = pruned_view.squeeze(0)
+                                    flattened_views.append(pruned_view)
+                                if len(flattened_views) == 0:
+                                    flattened_feature = image_feature.flatten(0, 1)
+                                else:
+                                    flattened_feature = torch.cat(flattened_views, dim=0)
+                            elif isinstance(pruned_views, torch.Tensor) and pruned_views.dim() == 3:
+                                flattened_feature = pruned_views.flatten(0, 1)
+                            else:
+                                flattened_feature = pruned_views
+
+                            new_image_features.append(flattened_feature)
+                            image_feature_strategy_applied.append(True)
+                            continue
+
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
                         height = width = self.get_vision_tower().num_patches_per_side
@@ -416,26 +450,30 @@ class LlavaMetaForCausalLM(ABC):
                         else:
                             image_feature = torch.cat((base_image_feature, image_feature), dim=0) # [4665, 3584]
                         new_image_features.append(image_feature)
+                        image_feature_strategy_applied.append(False)
                     else:  # single image operations
                         image_feature = image_feature[0]
                         if "unpad" in mm_patch_merge_type:
                             image_feature = torch.cat((image_feature, self.model.image_newline[None]), dim=0)
 
                         new_image_features.append(image_feature)
+                        image_feature_strategy_applied.append(False)
                 image_features = new_image_features
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_features = self.encode_images(images)
+            image_feature_strategy_applied = [False] * len(image_features)
 
         # 应用 token prune 策略（如果有）- 在空间合并之后应用
-        from llava.model.token_prune_strategies import get_global_strategy
-        strategy = get_global_strategy()
         if strategy is not None:
             try:
                 # 对每个图像特征单独应用策略
                 pruned_image_features = []
                 for idx, img_feat in enumerate(image_features):
+                    if idx < len(image_feature_strategy_applied) and image_feature_strategy_applied[idx]:
+                        pruned_image_features.append(img_feat)
+                        continue
                     orig_img_feat_dim = img_feat.dim()
                     # 注意：这里我们传递 None 作为 images，因为策略不需要原始图像
                     # 同时，特征已经经过 mm_projector，所以策略需要能够处理这种情况

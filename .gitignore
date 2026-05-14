@@ -26,6 +26,7 @@ models--*/
 wandb
 output
 llavavid
+.dbg/
 
 checkpoints
 project_checkpoints

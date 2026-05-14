@@ -9,6 +9,7 @@ def bipartite_soft_matching_merge(
     mode: str = "mean",
     protected_idx: Optional[torch.Tensor] = None,
     protected_penalty: Optional[float] = None,
+    token_order: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Modified from the implementation of paper https://arxiv.org/abs/2210.09461
@@ -29,6 +30,13 @@ def bipartite_soft_matching_merge(
         return None
 
     with torch.no_grad():
+        if token_order is not None:
+            if token_order.dim() != 1 or token_order.numel() != t:
+                raise ValueError(f"token_order must be a 1D tensor of length {t}, got {tuple(token_order.shape)}")
+            token_order = token_order.to(device=metric.device, dtype=torch.long)
+            metric = metric.index_select(1, token_order)
+            x = x.index_select(1, token_order)
+
         metric = metric / metric.norm(dim=-1, keepdim=True)
         a, b = metric[..., ::2, :], metric[..., 1::2, :] # a: source, b: dst
         scores = a @ b.transpose(-1, -2) # row: source, col: dst
