@@ -1,7 +1,9 @@
-# Scipt to calculate the prefill with different token numbers at different layers (Our Method, noted that Qwen2 has 28 layers, while the vicuna has 32 layers)
-python3 analyze_flex_prefill_only.py Qwen/Qwen2-7B nvidia_A100 --config_file configs/Llama.py --skip-mlp-bias
+# Script to calculate the prefill for the final llava1.5 anchor16 schedule.
+python3 analyze_flex_prefill_only.py lmsys/vicuna-7b-v1.5 nvidia_A100 --config_file configs/Llama.py --preset llava15_anchor16 --skip-mlp-bias
 
-# python3 analyze_flex_prefill_only.py lmsys/vicuna-7b-v1.5 nvidia_A100 --config_file configs/Llama.py 
+# Legacy examples:
+# python3 analyze_flex_prefill_only.py Qwen/Qwen2-7B nvidia_A100 --config_file configs/Llama.py --preset qwen2_default_aim --skip-mlp-bias
+# python3 analyze_flex_prefill_only.py lmsys/vicuna-7b-v1.5 nvidia_A100 --config_file configs/Llama.py --preset vicuna_default_aim
 
 
 # Scipt to calculate the prefill with same token numbers at different layers (LLaVA-PruMerge)
