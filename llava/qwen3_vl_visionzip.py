@@ -1368,6 +1368,8 @@ def _cg_forward(
                 spatial_merge_size ** 2,
                 pixel_values.device,
             )
+        else:
+            keep_indices = soft_merged_indices
         if _to_bool(_PATCH_CONFIG.get("verbose")):
             original = [int((t * h * w) // (spatial_merge_size ** 2)) for t, h, w in image_grid_thw.tolist()]
             reduced = [
