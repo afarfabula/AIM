@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import urllib.request
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
@@ -49,6 +50,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _allow_legacy_qwen3_bishe_hardprune() -> bool:
+    return _env_flag("ALLOW_LEGACY_QWEN3_BISHE_HARDPRUNE", False)
+
+
 def _prefetch_qwen3_snapshot(pretrained: str) -> str:
     if os.path.isdir(pretrained):
         return pretrained
@@ -87,6 +92,37 @@ def _prefetch_qwen3_snapshot(pretrained: str) -> str:
         )
 
 
+def _parse_token_prune_config(token_prune_config: Optional[str]) -> dict:
+    cfg_kv = {}
+    if not token_prune_config:
+        return cfg_kv
+
+    # 用 shell-safe 的外层分隔符编码 token_prune_config，避免与
+    # lmms-eval 的 `,` 冲突，也避免远程 worker 命令里 `;` 被 shell 吃掉。
+    # 目前兼容：`,` / `;` / `|` / `~`。
+    # 内层 key/value 仍优先用 `:`，同时兼容 `=`。
+    for piece in re.split(r"[;,|~]", token_prune_config):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if ":" in piece:
+            k, v = piece.split(":", 1)
+        elif "=" in piece:
+            k, v = piece.split("=", 1)
+        else:
+            continue
+        k = k.strip()
+        v = v.strip()
+        try:
+            cfg_kv[k] = int(v)
+        except ValueError:
+            try:
+                cfg_kv[k] = float(v)
+            except ValueError:
+                cfg_kv[k] = v
+    return cfg_kv
+
+
 @register_model("qwen3_vl")
 class Qwen3_VL(lmms):
     """
@@ -106,6 +142,8 @@ class Qwen3_VL(lmms):
         max_pixels: int = 256 * 28 * 28,
         min_pixels: int = 3136,
         max_num_frames: int = 32,
+        token_prune_strategy: Optional[str] = None,
+        token_prune_config: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -132,6 +170,9 @@ class Qwen3_VL(lmms):
         if attn_implementation is None and use_flash_attention_2:
             attn_implementation = "flash_attention_2"
 
+        strategy = token_prune_strategy.strip().lower() if token_prune_strategy else None
+        cfg_kv = _parse_token_prune_config(token_prune_config)
+
         resolved_pretrained = _prefetch_qwen3_snapshot(pretrained)
         model_cls = _choose_qwen3_model_cls(resolved_pretrained)
         # Qwen3-VL is published in bf16, and `dtype=auto` was enough to trigger
@@ -148,6 +189,46 @@ class Qwen3_VL(lmms):
         if attn_implementation:
             model_kwargs["attn_implementation"] = attn_implementation
         self._model = model_cls.from_pretrained(resolved_pretrained, **model_kwargs).eval()
+
+        # Optional visual token reduction patches
+        if strategy:
+            if strategy in {
+                "visionzip",
+                "bishe_anchor16_v6",
+                "bishemethod_v2stage_anchor16_aware_v6",
+                "pixelprune",
+                "pixel_prune",
+            }:
+                # 直接通过文件路径加载，避免 `llava/__init__.py` 的副作用
+                import importlib.util
+                if strategy == "bishemethod_v2stage_anchor16_aware_v6":
+                    adapter_path = os.environ.get(
+                        "QWEN3_BISHEMETHOD_V2STAGE_ANCHOR16_AWARE_V6_PATH",
+                        "/root/AIM/llava/qwen3_vl_bishemethod_v2stage_anchor16_aware_v6.py",
+                    )
+                    spec = importlib.util.spec_from_file_location(
+                        "qwen3_vl_bishemethod_v2stage_anchor16_aware_v6", adapter_path
+                    )
+                    bishe_mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(bishe_mod)
+                    eval_logger.warning(
+                        f"token_prune_strategy={token_prune_strategy} 已切换到 Qwen3-VL soft-merge bishemethod 适配层"
+                    )
+                    bishe_mod.apply_bishemethod_v2stage_anchor16_aware_v6_to_qwen3_vl(self._model, **cfg_kv)
+                else:
+                    vz_path = os.environ.get(
+                        "QWEN3_VISIONZIP_PATH", "/root/AIM/llava/qwen3_vl_visionzip.py"
+                    )
+                    spec = importlib.util.spec_from_file_location("qwen3_vl_visionzip", vz_path)
+                    vz_mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(vz_mod)
+                    if strategy != "visionzip":
+                        eval_logger.warning(
+                            f"token_prune_strategy={token_prune_strategy} 已统一切换到 AIM 内部的 hard-prune 实现"
+                        )
+                    vz_mod.apply_visionzip_to_qwen3_vl(self._model, **cfg_kv)
+            else:
+                eval_logger.warning(f"Unknown token_prune_strategy={token_prune_strategy}; ignored")
 
         self.processor = AutoProcessor.from_pretrained(resolved_pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
         self._tokenizer = getattr(self.processor, "tokenizer", None) or AutoTokenizer.from_pretrained(resolved_pretrained)

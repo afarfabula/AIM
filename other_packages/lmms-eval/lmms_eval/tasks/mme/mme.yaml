@@ -1,6 +1,6 @@
 dataset_path: lmms-lab/MME
 dataset_kwargs:
-  token: True
+  token: false
 task: "mme"
 test_split: test
 output_type: generate_until
